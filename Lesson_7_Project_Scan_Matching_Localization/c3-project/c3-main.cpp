@@ -99,7 +99,69 @@ void drawCar(Pose pose, int num, Color color, double alpha, pcl::visualization::
 	renderBox(viewer, box, num, color, alpha);
 }
 
-int main(){
+// ICP algorithm
+// Finds the transform matrix matching source with map cloud points.
+Eigen::Matrix4d ICP(PointCloudT::Ptr target, PointCloudT::Ptr source, Pose startingPose) {
+    Eigen::Matrix4d transformation_matrix = Eigen::Matrix4d::Identity();
+	// Align source with starting pose
+    Eigen::Matrix4d initTransform = transform3D(startingPose.rotation.yaw, startingPose.rotation.pitch, startingPose.rotation.roll, startingPose.position.x, startingPose.position.y, startingPose.position.z);
+    PointCloudT::Ptr transformSource (new PointCloudT);
+    pcl::transformPointCloud (*source, *transformSource, initTransform);
+
+    pcl::console::TicToc time;
+    time.tic();
+
+    pcl::IterativeClosestPoint<PointT, PointT> icp;
+    icp.setTransformationEpsilon(1e-8);
+    icp.setMaximumIterations(50);
+    icp.setInputSource(transformSource);
+    icp.setInputTarget(target);
+    //icp.setMaxCorrespondenceDistance(25);
+
+    PointCloudT::Ptr cloud_icp (new PointCloudT); // ICP output point cloud
+    icp.align(*cloud_icp);
+    cout << "ICP has converged: " << icp.hasConverged() << " score: " << icp.getFitnessScore() <<  " in: " << time.toc() <<  " ms" << endl;
+
+    if (icp.hasConverged())
+	{
+		transformation_matrix = icp.getFinalTransformation().cast<double>();
+		transformation_matrix =  transformation_matrix * initTransform;
+		return transformation_matrix;
+    }
+	else cout << "WARNING: ICP did not converge" << endl;
+
+    return transformation_matrix;
+}
+
+// NDT algorithm
+// Finds the transform matrix matching source with map cloud points.
+Eigen::Matrix4d NDT(PointCloudT::Ptr mapCloud, PointCloudT::Ptr source, Pose startingPose) {
+    pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt;
+    ndt.setTransformationEpsilon(1e-8);
+    //ndt.setStepSize(2);
+    ndt.setResolution(1);
+    ndt.setInputTarget(mapCloud);
+	ndt.setMaximumIterations(50);
+    ndt.setInputSource(source);
+
+    pcl::console::TicToc time;
+    time.tic();
+
+    Eigen::Matrix4f startingGuess = transform3D(startingPose.rotation.yaw, startingPose.rotation.pitch, startingPose.rotation.roll, startingPose.position.x, startingPose.position.y, startingPose.position.z).cast<float>();
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ndt(new pcl::PointCloud<pcl::PointXYZ>);
+    ndt.align(*cloud_ndt, startingGuess);
+    cout << "NDT has converged: " << ndt.hasConverged() << " score: " << ndt.getFitnessScore() <<  " in: " << time.toc() <<  " ms" << endl;
+    Eigen::Matrix4d transformation_matrix = ndt.getFinalTransformation().cast<double>();
+
+    return transformation_matrix;
+}
+
+int main(int argc, char *argv[]) {
+	// Which algorithm to use. Normal Distributions Transform (NDT): 1, Iterative Closest Point (ICP): 0
+	int MATCHING_ALGO = 1;
+	// Scan counter
+	int num_scan = 0;
 
 	auto client = cc::Client("localhost", 2000);
 	client.SetTimeout(2s);
@@ -116,9 +178,9 @@ int main(){
 	auto lidar_bp = *(blueprint_library->Find("sensor.lidar.ray_cast"));
 	// CANDO: Can modify lidar values to get different scan resolutions
 	lidar_bp.SetAttribute("upper_fov", "15");
-    lidar_bp.SetAttribute("lower_fov", "-25");
-    lidar_bp.SetAttribute("channels", "32");
-    lidar_bp.SetAttribute("range", "30");
+	lidar_bp.SetAttribute("lower_fov", "-25");
+	lidar_bp.SetAttribute("channels", "32");
+	lidar_bp.SetAttribute("range", "30");
 	lidar_bp.SetAttribute("rotation_frequency", "60");
 	lidar_bp.SetAttribute("points_per_second", "500000");
 
@@ -150,11 +212,11 @@ int main(){
 		if(new_scan){
 			auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
 			for (auto detection : *scan){
-				if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){
-					pclCloud.points.push_back(PointT(detection.x, detection.y, detection.z));
+				if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){ // Don't include points touching ego
+					pclCloud.points.push_back(PointT(-detection.y, detection.x, -detection.z));
 				}
 			}
-			if(pclCloud.points.size() > 5000){ // CANDO: Can modify this value to get different scan resolutions
+			if(pclCloud.points.size() > 5000) { // CANDO: Can modify this value to get different scan resolutions
 				lastScanTime = std::chrono::system_clock::now();
 				*scanCloud = pclCloud;
 				new_scan = false;
@@ -198,18 +260,41 @@ int main(){
   		viewer->spinOnce ();
 		
 		if(!new_scan){
-			
+
+			if(num_scan == 0) { // The ground truth only used at the beginning
+				pose.position = truePose.position;
+				pose.rotation = truePose.rotation;
+			}
+			// Count the number of scans.
+			num_scan++;
+
 			new_scan = true;
 			// TODO: (Filter scan using voxel filter)
+
+			pcl::VoxelGrid<PointT> vg;
+			vg.setInputCloud(scanCloud);
+			vg.setLeafSize(0.5, 0.5, 0.5); // filter resolution
+			typename pcl::PointCloud<PointT>::Ptr cloudFiltered (new pcl::PointCloud<PointT>);
+			vg.filter(*cloudFiltered); // filtered cloud points
 
 			// TODO: Find pose transform by using ICP or NDT matching
 			//pose = ....
 
+			// Find the matching transform by using either NDT or ICP
+			Eigen::Matrix4d matching_transform = MATCHING_ALGO ? NDT(mapCloud, cloudFiltered, pose) : ICP(mapCloud, cloudFiltered, pose);
+			// Get the pose based on the matching transform.
+			pose = getPose(matching_transform);
+
 			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+
+			PointCloudT::Ptr corrected_scan (new PointCloudT);
+			// Transform the filtered cloud into the corrected scan.
+			pcl::transformPointCloud *cloudFiltered, *corrected_scan, matching_transform);
 
 			viewer->removePointCloud("scan");
 			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, scanCloud, "scan", Color(1,0,0) );
+			//renderPointCloud(viewer, scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, corrected_scan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
